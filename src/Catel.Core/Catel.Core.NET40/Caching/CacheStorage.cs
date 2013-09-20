@@ -33,14 +33,9 @@ namespace Catel.Caching
         private readonly Dictionary<TKey, CacheStorageValueInfo<TValue>> _dictionary;
 
         /// <summary>
-        /// The synchronization object.
+        /// The reader/writer lock.
         /// </summary>
-        private readonly object _syncObj = new object();
-        
-        /// <summary>
-        /// The synchronization objects.
-        /// </summary>
-        private readonly Dictionary<TKey, object> _syncObjs = new Dictionary<TKey, object>();
+        private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
 
         /// <summary>
         /// The timer that is being executed to invalidate the cache.
@@ -93,9 +88,15 @@ namespace Catel.Caching
         {
             get
             {
-                lock (_syncObj)
+                _lock.EnterReadLock();
+
+                try
                 {
                     return _dictionary.Keys;
+                }
+                finally
+                {
+                    _lock.ExitReadLock();
                 }
             }
         }
@@ -111,11 +112,18 @@ namespace Catel.Caching
             Argument.IsNotNull("key", key);
 
             CacheStorageValueInfo<TValue> valueInfo;
-            lock (GetLockByKey(key))
+
+            _lock.EnterReadLock();
+
+            try
             {
                 _dictionary.TryGetValue(key, out valueInfo);
             }
-     
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
             return (valueInfo != null) ? valueInfo.Value : default(TValue);
         }
 
@@ -129,9 +137,15 @@ namespace Catel.Caching
         {
             Argument.IsNotNull("key", key);
 
-            lock (GetLockByKey(key))
+            _lock.EnterReadLock();
+
+            try
             {
                 return _dictionary.ContainsKey(key);
+            }
+            finally
+            {
+                _lock.ExitReadLock();
             }
         }
 
@@ -150,9 +164,12 @@ namespace Catel.Caching
         {
             Argument.IsNotNull("key", key);
             Argument.IsNotNull("code", code);
-            
+
             TValue value;
-            lock (GetLockByKey(key))
+
+            _lock.EnterWriteLock();
+
+            try
             {
                 bool containsKey = _dictionary.ContainsKey(key);
                 if (!containsKey || @override)
@@ -160,27 +177,38 @@ namespace Catel.Caching
                     value = code.Invoke();
                     if (!ReferenceEquals(value, null) || _storeNullValues)
                     {
-	                    if (expirationPolicy == null && _defaultExpirationPolicyInitCode != null)
-	                    {
-	                        expirationPolicy = _defaultExpirationPolicyInitCode.Invoke();
-	                    }
-	
-	                    var valueInfo = new CacheStorageValueInfo<TValue>(value, expirationPolicy);
-	                    lock (_syncObj)
-	                    {
-	                    	_dictionary[key] = valueInfo;
-	                    }
-	
-	                    if (valueInfo.CanExpire)
-	                    {
-	                        _checkForExpiredItems = true;
-	                    }
-	                }
+                        if (expirationPolicy == null && _defaultExpirationPolicyInitCode != null)
+                        {
+                            expirationPolicy = _defaultExpirationPolicyInitCode.Invoke();
+                        }
+
+                        var valueInfo = new CacheStorageValueInfo<TValue>(value, expirationPolicy);
+
+                        //_lock.EnterWriteLock();
+
+                        //try
+                        //{
+                            _dictionary[key] = valueInfo;
+                        //}
+                        //finally
+                        //{
+                        //    _lock.ExitWriteLock();
+                        //}
+
+                        if (valueInfo.CanExpire)
+                        {
+                            _checkForExpiredItems = true;
+                        }
+                    }
                 }
                 else
                 {
-					value = _dictionary[key].Value;
+                    value = _dictionary[key].Value;
                 }
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
             }
 
             return value;
@@ -244,7 +272,9 @@ namespace Catel.Caching
         {
             Argument.IsNotNull("key", key);
 
-            lock (GetLockByKey(key))
+            _lock.EnterWriteLock();
+
+            try
             {
                 if (_dictionary.ContainsKey(key))
                 {
@@ -256,6 +286,10 @@ namespace Catel.Caching
                     _dictionary.Remove(key);
                 }
             }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
         }
 
         /// <summary>
@@ -264,17 +298,21 @@ namespace Catel.Caching
         public void Clear()
         {
             var keysToRemove = new List<TKey>();
-            lock (_syncObj)
+
+            _lock.EnterWriteLock();
+
+            try
             {
                 keysToRemove.AddRange(_dictionary.Keys);
-            }
 
-            foreach (var keyToRemove in keysToRemove)
-            {
-                lock (GetLockByKey(keyToRemove))
+                foreach (var keyToRemove in keysToRemove)
                 {
                     _dictionary.Remove(keyToRemove);
                 }
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
             }
         }
 
@@ -288,7 +326,10 @@ namespace Catel.Caching
 
             var keysToRemove = new List<TKey>();
 
-            lock (_syncObj)
+            //_lock.EnterUpgradeableReadLock();
+            _lock.EnterWriteLock();
+
+            try
             {
                 foreach (var cacheItem in _dictionary)
                 {
@@ -303,40 +344,28 @@ namespace Catel.Caching
                         containsItemsThatCanExpire = true;
                     }
                 }
-            }
 
-            foreach (var keyToRemove in keysToRemove)
+                //_lock.EnterWriteLock();
+
+                //try
+                //{
+                    foreach (var keyToRemove in keysToRemove)
+                    {
+                        _dictionary.Remove(keyToRemove);
+                    }
+                //}
+                //finally
+                //{
+                //    _lock.ExitWriteLock();
+                //}
+
+                _checkForExpiredItems = containsItemsThatCanExpire;
+            }
+            finally
             {
-                lock (GetLockByKey(keyToRemove))
-                {
-                    _dictionary.Remove(keyToRemove);
-                }
+                //_lock.ExitUpgradeableReadLock();
+                _lock.ExitWriteLock();
             }
-   
-            _checkForExpiredItems = containsItemsThatCanExpire;
-        }
-
-        /// <summary>
-        /// Gets the lock by key
-        /// </summary>
-        /// <param name="key">
-        /// The key
-        /// </param>
-        /// <returns>
-        /// The lock object
-        /// </returns>
-        private object GetLockByKey(TKey key)
-        {
-            lock (_syncObj)
-            {
-                var containsKey = _syncObjs.ContainsKey(key);
-                if (!containsKey)
-                {
-                    _syncObjs[key] = new object();
-                }
-            }
-
-            return _syncObjs[key];
         }
 
         /// <summary>
